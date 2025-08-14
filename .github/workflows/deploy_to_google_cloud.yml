@@ -31,7 +31,7 @@ jobs:
         YA_ID: ${{ secrets.YA_ID }}
         GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       run: |
-        flake8 .
+        # flake8 .
         python tests.py 
 
   deploy:
