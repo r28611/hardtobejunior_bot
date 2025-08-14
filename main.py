@@ -5,7 +5,7 @@ from threading import Timer
 import telebot
 
 from api import (find_url, read_url, send_conversation, summ_with_groq,
-                 writing_message)
+                 writing_message, scrape_linkedin_jobs, format_jobs_message)
 from config import logger, settings
 from db import DataBase
 from health_endpoint import flask_thread, shutdown_event
@@ -21,6 +21,7 @@ bot.set_my_commands(
     [
         telebot.types.BotCommand("/read_link", "Что там за ссылкой?"),
         telebot.types.BotCommand("/house_points", "Баллы факультетов"),
+        telebot.types.BotCommand("/positions", "IT jobs in Netherlands"),
     ]
 )
 
@@ -29,6 +30,7 @@ bot.set_my_commands(
         telebot.types.BotCommand("/read_link", "Что там за ссылкой?"),
         telebot.types.BotCommand("/show_logs", "Показать логи"),
         telebot.types.BotCommand("/house_points", "Баллы факультетов"),
+        telebot.types.BotCommand("/positions", "IT jobs in Netherlands"),
     ],
     scope=telebot.types.BotCommandScopeChat(INSPECT_ID),
 )
@@ -39,6 +41,7 @@ if not settings.DEBUG:
             commands=[
                 telebot.types.BotCommand("/read_link", "Что там за ссылкой?"),
                 telebot.types.BotCommand("/house_points", "Баллы факультетов"),
+                telebot.types.BotCommand("/positions", "IT jobs in Netherlands"),
             ],
             scope=telebot.types.BotCommandScopeChat(ADMIN_ID),
         )
@@ -118,6 +121,28 @@ def show_stat(message):
         answer_stat = read_records()
         return bot.send_message(
             message.chat.id, answer_stat, parse_mode="Markdown"
+        )
+
+
+@bot.message_handler(commands=["positions"])
+def get_positions(message):
+    """Scrapes and shows latest IT job positions in The Netherlands."""
+    bot.send_message(
+        message.chat.id,
+        "🔍 Searching for IT jobs in The Netherlands... This may take a moment.",
+        parse_mode="Markdown"
+    )
+    
+    try:
+        jobs = scrape_linkedin_jobs()
+        jobs_message = format_jobs_message(jobs)
+        bot.send_message(message.chat.id, jobs_message, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in positions command: {e}")
+        bot.send_message(
+            message.chat.id,
+            "❌ Sorry, there was an error fetching job positions. Please try again later.",
+            parse_mode="Markdown"
         )
 
 
