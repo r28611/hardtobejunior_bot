@@ -1,8 +1,11 @@
+import os
+import sys
 from threading import Timer
 
 import telebot
 
-from api import find_url, read_url, send_conversation, writing_message
+from api import (find_url, read_url, send_conversation, summ_with_groq,
+                 writing_message, scrape_linkedin_jobs, format_jobs_message)
 from config import logger, settings
 from db import DataBase
 from health_endpoint import flask_thread, shutdown_event
@@ -18,6 +21,7 @@ bot.set_my_commands(
     [
         telebot.types.BotCommand("/read_link", "Что там за ссылкой?"),
         telebot.types.BotCommand("/house_points", "Баллы факультетов"),
+        telebot.types.BotCommand("/positions", "IT jobs in Netherlands"),
     ]
 )
 
@@ -26,6 +30,7 @@ bot.set_my_commands(
         telebot.types.BotCommand("/read_link", "Что там за ссылкой?"),
         telebot.types.BotCommand("/show_logs", "Показать логи"),
         telebot.types.BotCommand("/house_points", "Баллы факультетов"),
+        telebot.types.BotCommand("/positions", "IT jobs in Netherlands"),
     ],
     scope=telebot.types.BotCommandScopeChat(INSPECT_ID),
 )
@@ -36,6 +41,7 @@ if not settings.DEBUG:
             commands=[
                 telebot.types.BotCommand("/read_link", "Что там за ссылкой?"),
                 telebot.types.BotCommand("/house_points", "Баллы факультетов"),
+                telebot.types.BotCommand("/positions", "IT jobs in Netherlands"),
             ],
             scope=telebot.types.BotCommandScopeChat(ADMIN_ID),
         )
@@ -103,40 +109,75 @@ def show_logs(message):
 def show_stat(message):
     """Shows statistic of score by faculty."""
     if message.chat.id == INSPECT_ID:
-        answer_stat = read_records(ADMIN_ID)
+        answer_stat = read_records()
         bot.send_message(message.chat.id, answer_stat, parse_mode="Markdown")
-        answer_stat = read_records(INSPECT_ID)
+        answer_stat = read_records(test=True)
         now = get_time(1)
         answer_stat = f'{now.strftime("%m/%d/%Y, %H:%M:%S")}\n\n' + answer_stat
         return bot.send_message(
             message.chat.id, answer_stat, parse_mode="Markdown"
         )
     else:
-        answer_stat = read_records(ADMIN_ID)
+        answer_stat = read_records()
         return bot.send_message(
             message.chat.id, answer_stat, parse_mode="Markdown"
         )
 
 
+@bot.message_handler(commands=["positions"])
+def get_positions(message):
+    """Scrapes and shows latest IT job positions in The Netherlands."""
+    bot.send_message(
+        message.chat.id,
+        "🔍 Searching for IT jobs in The Netherlands... This may take a moment.",
+        parse_mode="Markdown"
+    )
+    
+    try:
+        jobs = scrape_linkedin_jobs()
+        jobs_message = format_jobs_message(jobs)
+        bot.send_message(message.chat.id, jobs_message, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in positions command: {e}")
+        bot.send_message(
+            message.chat.id,
+            "❌ Sorry, there was an error fetching job positions. Please try again later.",
+            parse_mode="Markdown"
+        )
+
+
 @bot.message_handler(commands=["summ_1"])
 def summary(message):
-    """Summarizes last 30 messages in the chat."""
-    if message.chat.type == "private" and message.from_user.id != INSPECT_ID:
+    """Summarizes last n-messages in the chat."""
+    if message.from_user.id != INSPECT_ID:
         return
     db = DataBase()
     messages = db.read_messages(settings.NUM_MESSAGES)
     db.close()
-    content = "<br><br>".join(
+    content = "; ".join(
         [
-            f"<b>{text[0]}:</b> {text[2]}"
+            f"{text[0]}: {text[2]}"
             if text[1] is None
-            else f"<b>{text[0]}, {text[1]}:</b> {text[2]}"
+            else f"{text[0]}, {text[1]}: {text[2]}"
             for text in reversed(messages)
         ]
     )
-    pre = "Последние 30 сообщений в этом чате в глазах бота:\n\n"
-    answer = send_conversation(content)
-    bot.send_message(message.chat.id, pre + answer)
+    file_path = "summary.txt"
+    pre_answer = summ_with_groq(content)
+    try:
+        sys.stdout.write(str(pre_answer))
+    except Exception as e:
+        sys.stdout.write(f"Write out failed {e}")
+    answer = (
+        f"{pre_answer.choices[0].message.content}\n\n"
+        f"Tokens: {pre_answer.usage.total_tokens}"
+    )
+    with open(file_path, "w", encoding="utf-8") as file:
+        file.write(content)
+    with open(file_path, "rb") as file:
+        bot.send_document(message.chat.id, file)
+    os.remove(file_path)
+    bot.send_message(message.chat.id, answer)
 
 
 @bot.message_handler(commands=["summ_2"])
@@ -148,9 +189,9 @@ def sum_me(message):
     db.close()
     content = "<br><br>".join(
         [
-            f"<b>{text[0]}:</b> {text[2]}"
+            f"{text[0]}: {text[2]}"
             if text[1] is None
-            else f"<b>{text[0]}, {text[1]}:</b> {text[2]}"
+            else f"{text[0]}, {text[1]}: {text[2]}"
             for text in reversed(messages)
         ]
     )
@@ -165,8 +206,11 @@ def handle_text(message) -> None:
     Searches for record command from admin to add new scores record
     to one of the faculties.
     """
+    admin = is_admin(message)
     if (
-        message.from_user.id == ADMIN_ID or message.from_user.id == INSPECT_ID
+        message.from_user.id == ADMIN_ID
+        or message.from_user.id == INSPECT_ID
+        or admin
     ) and settings.START_WORLD in message.text.lower():
         score = [_ for _ in message.text if _.isdigit()]
         minus = (
@@ -174,13 +218,16 @@ def handle_text(message) -> None:
         )
         if score:
             score = int("".join(score))
-        faculty = [
-            _
-            for _ in message.text.split()
-            if _.lower().startswith(tuple(settings.FACULTY.keys()))
-        ]
+            if str(score) not in message.text.lower():
+                score = None
+        faculty = []
+        for word in message.text.split():
+            for key in tuple(settings.FACULTY.keys()):
+                if word.lower().startswith(key):
+                    faculty.append(key)
+                    break
         if faculty:
-            faculty = settings.FACULTY[faculty[0][:5].lower()]
+            faculty = settings.FACULTY[faculty[0].lower()]
         if score and faculty:
             score = -score if minus else score
             answer = new_score_record(faculty, score, message.from_user.id)
@@ -189,17 +236,10 @@ def handle_text(message) -> None:
             )
     elif (
         message.from_user.id == ADMIN_ID or message.from_user.id == INSPECT_ID
-    ) and message.text.lower() == "стата":
-        answer_stat = read_records(ADMIN_ID)
-        return bot.send_message(
-            message.chat.id, answer_stat, parse_mode="Markdown"
-        )
-    elif (
-        message.from_user.id == ADMIN_ID or message.from_user.id == INSPECT_ID
     ) and message.text.lower() == "тестстата":
         global FRIDAY_MODE
         FRIDAY_MODE = True
-        answer_stat = read_records(INSPECT_ID)
+        answer_stat = read_records(test=True)
         return bot.send_message(
             message.chat.id, answer_stat, parse_mode="Markdown"
         )
@@ -221,10 +261,10 @@ def handle_text(message) -> None:
 def new_score_record(faculty: str, score: int, id: int) -> str:
     """Adds new scores record to the database."""
     db = DataBase()
-    if id == ADMIN_ID:
-        db.save_points(faculty, score)
-    else:
+    if id == INSPECT_ID:
         db.test_save_points(faculty, score)
+    else:
+        db.save_points(faculty, score)
     db.close()
     if score >= 0:
         answer = (
@@ -239,10 +279,10 @@ def new_score_record(faculty: str, score: int, id: int) -> str:
     return answer
 
 
-def read_records(id: int) -> str:
+def read_records(test: bool = False) -> str:
     """Fetch all scores statistic from the database."""
     db = DataBase()
-    if id == int(ADMIN_ID):
+    if not test:
         faculty_stat = db.get_all_points()
         header = "Статистика на данный момент:\n\n"
     else:
@@ -258,6 +298,14 @@ def read_records(id: int) -> str:
     return header + answer_stat
 
 
+def is_admin(message):
+    """Check if user is a admin of the group"""
+    status = bot.get_chat_member(message.chat.id, message.from_user.id).status
+    if status == "creator" or status == "administrator":
+        return True
+    return False
+
+
 def monitoring_friday_talks():
     """Every minute checks the Friday's talks conditions.
     If the Friday starts - sends a message to the chat.
@@ -265,7 +313,7 @@ def monitoring_friday_talks():
     """
     one_minute_monitor = Timer(60.0, monitoring_friday_talks)
     one_minute_monitor.start()
-    now = get_time(1)
+    now = get_time(2)
     global FRIDAY_MODE
     if now.weekday() == 4:
         from_midnight = int(
@@ -305,7 +353,7 @@ if __name__ == "__main__":
     db.create_database()
     db.close()
     flask_thread.start()
-    monitoring_friday_talks()
+    # monitoring_friday_talks()
     try:
         bot.infinity_polling(timeout=10, long_polling_timeout=5)
     except Exception as e:
